@@ -1,28 +1,14 @@
+#define IGNORE_DMG
+
 #include <Arduino.h>
 
 #include "env.h"
-#include "ArduinoJson.h"
 #include "communication.h"
+#include "sd_card.h"
 
-const char ssid[] = SSID_ENV;
-const char pass[] = PASSWORD_ENV;
-
-const char mqtt_host[] = MQTT_HOST_ENV;
-const int mqtt_port = MQTT_PORT_ENV;
-
-JsonDocument data;
-
-#define BLINDS_1_PIN 19
-#define BLINDS_2_PIN 21
-#define WINDOW_PIN 18
-
-#define BLINDS_1_LED 13
-#define BLINED_2_LED 12
-#define WINDOW_LED 14
-
-int blinds_1_state;
-int blinds_2_state;
-int window_state;
+#define BLINDS_1_PIN 0
+#define BLINDS_2_PIN 26
+#define WINDOW_PIN 25
 
 void callback(String &topic, String &payload)
 {
@@ -32,71 +18,121 @@ void callback(String &topic, String &payload)
   Serial.println(payload);
 }
 
-Communication comm(SSID_ENV, PASSWORD_ENV, "/esp32/", MQTT_HOST_ENV, MQTT_PORT_ENV, callback);
+int blinds_1_state = -1;
+int blinds_2_state = -1;
+int window_state = -1;
+unsigned long lastDataUploadMillis = 0;
 
-void setup()
+auto comm = Communication::get_instance(SSID_ENV, PASSWORD_ENV, "esp32/window/", MQTT_HOST_ENV, MQTT_PORT_ENV, callback);
+
+bool upload_init = false;
+String header = "timestamp,blinds_1_state,blinds_2_state,window_state\n";
+
+String get_todays_file_path()
 {
-  Serial.begin(115200);
+  return "/" + comm->get_todays_date_string() + ".csv";
+};
 
-  pinMode(BLINDS_1_PIN, INPUT_PULLUP);
-  pinMode(BLINDS_2_PIN, INPUT_PULLUP);
-  pinMode(WINDOW_PIN, INPUT_PULLUP);
-  pinMode(BLINDS_1_LED, OUTPUT);
-  pinMode(BLINED_2_LED, OUTPUT);
-  pinMode(WINDOW_LED, OUTPUT);
-
-  while (!Serial)
-    ;
-  comm.setup();
-}
-
-void loop()
+String get_yesterdays_file_path()
 {
-  comm.handle_mqtt_loop();
+  return "/" + comm->get_yesterdays_date_string() + ".csv";
+};
+
+String output = "";
+
+void read_data()
+{
+  if (blinds_1_state == digitalRead(BLINDS_1_PIN) && blinds_2_state == digitalRead(BLINDS_2_PIN) && window_state == digitalRead(WINDOW_PIN))
+  {
+    return;
+  }
 
   blinds_1_state = digitalRead(BLINDS_1_PIN);
   blinds_2_state = digitalRead(BLINDS_2_PIN);
   window_state = digitalRead(WINDOW_PIN);
 
-  data.clear();
+  output = "";
+  output += String(comm->get_rawtime()) + ",";
+  output += (blinds_1_state == HIGH) ? "1," : "0,";
+  output += (blinds_2_state == HIGH) ? "1," : "0,";
+  output += (window_state == HIGH) ? "1\n" : "0\n";
 
-  data["time"] = millis();
-
-  if (blinds_1_state == HIGH)
+  if (!file_exists(SD, get_todays_file_path().c_str()))
   {
-    data["blinds_1"] = "open";
-    digitalWrite(BLINDS_1_LED, HIGH);
+    write_file(SD, get_todays_file_path().c_str(), header.c_str());
+  }
+  append_file(SD, get_todays_file_path().c_str(), output.c_str());
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  if (!SD.begin(14))
+  {
+    Serial.println("Card Mount Failed");
+    return;
+  }
+  uint8_t cardType = SD.cardType();
+
+  if (cardType == CARD_NONE)
+  {
+    Serial.println("No SD card attached");
+    return;
+  }
+
+  Serial.print("SD Card Type: ");
+  if (cardType == CARD_MMC)
+  {
+    Serial.println("MMC");
+  }
+  else if (cardType == CARD_SD)
+  {
+    Serial.println("SDSC");
+  }
+  else if (cardType == CARD_SDHC)
+  {
+    Serial.println("SDHC");
   }
   else
   {
-    data["blinds_1"] = "closed";
-    digitalWrite(BLINDS_1_LED, LOW);
+    Serial.println("UNKNOWN");
   }
 
-  if (blinds_2_state == HIGH)
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+
+  pinMode(BLINDS_1_PIN, INPUT_PULLUP);
+  pinMode(BLINDS_2_PIN, INPUT_PULLUP);
+  pinMode(WINDOW_PIN, INPUT_PULLUP);
+
+  comm->setup();
+  delay(2000);
+}
+
+void loop()
+{
+  comm->handle_mqtt_loop();
+  read_data();
+  auto current_time = comm->get_localtime();
+  if (current_time->tm_hour == 1 && !upload_init)
   {
-    data["blinds_2"] = "open";
-    digitalWrite(BLINED_2_LED, HIGH);
+    upload_init = true;
+    comm->publish("data", read_file(SD, get_yesterdays_file_path().c_str()));
   }
-  else
+  if (current_time->tm_hour == 2 && upload_init)
   {
-    data["blinds_2"] = "closed";
-    digitalWrite(BLINED_2_LED, LOW);
+    list_dir(SD, "/", 0);
+    upload_init = false;
+    checkAndCleanFileSystem(SD);
   }
 
-  if (window_state == HIGH)
-  {
-    data["window"] = "open";
-    digitalWrite(WINDOW_LED, HIGH);
-  }
-  else
-  {
-    data["window"] = "closed";
-    digitalWrite(WINDOW_LED, LOW);
-  }
-
-  String output;
-  serializeJson(data, output);
-  comm.publish("window_sensor", output);
-  delay(5000);
+  // if (millis() - lastDataUploadMillis > 60000)
+  // {
+  //   lastDataUploadMillis = millis();
+  //   if (file_exists(SD, get_todays_file_path().c_str()))
+  //   {
+  //     comm->publish("current_data", read_file(SD, get_todays_file_path().c_str()));
+  //   }
+  // }
 }
