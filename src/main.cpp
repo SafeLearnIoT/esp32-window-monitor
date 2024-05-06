@@ -22,6 +22,8 @@ int blinds_1_state = -1;
 int blinds_2_state = -1;
 int window_state = -1;
 unsigned long lastDataUploadMillis = 0;
+unsigned long lastStateCheck = 0;
+unsigned long lastHealthPing = 0;
 
 auto comm = Communication::get_instance(SSID_ENV, PASSWORD_ENV, "esp32/window/", MQTT_HOST_ENV, MQTT_PORT_ENV, callback);
 
@@ -107,18 +109,36 @@ void setup()
   pinMode(WINDOW_PIN, INPUT_PULLUP);
 
   comm->setup();
-  delay(2000);
+  delay(5000);
+  comm->pause_communication();
 }
 
 void loop()
 {
-  comm->handle_mqtt_loop();
-  read_data();
+  if (millis() - lastStateCheck > 60000)
+  {
+    lastStateCheck = millis();
+    read_data();
+  }
+
+  if (millis() - lastHealthPing > 900000)
+  {
+    lastHealthPing = millis();
+    comm->resume_communication();
+    delay(5000);
+    comm->pause_communication();
+  }
+
   auto current_time = comm->get_localtime();
   if (current_time->tm_hour == 1 && !upload_init)
   {
+    comm->resume_communication();
+    delay(2000);
+    comm->handle_mqtt_loop();
     upload_init = true;
     comm->publish("data", read_file(SD, get_yesterdays_file_path().c_str()));
+    delay(2000);
+    comm->pause_communication();
   }
   if (current_time->tm_hour == 2 && upload_init)
   {
