@@ -1,8 +1,7 @@
-#define IGNORE_DMG
-
 #include <Arduino.h>
 
 #include "env.h"
+#include "rtpnn.h"
 #include "communication.h"
 #include "sd_card.h"
 
@@ -21,88 +20,18 @@ void callback(String &topic, String &payload)
 int blinds_1_state = -1;
 int blinds_2_state = -1;
 int window_state = -1;
-unsigned long lastDataUploadMillis = 0;
 unsigned long lastStateCheck = 0;
 unsigned long lastHealthPing = 0;
 
+rTPNN::SDP<int> blinds_1_sdp(rTPNN::SDPType::Blinds);
+rTPNN::SDP<int> blinds_2_sdp(rTPNN::SDPType::Blinds);
+rTPNN::SDP<int> window_sdp(rTPNN::SDPType::Window);
+
 auto comm = Communication::get_instance(SSID_ENV, PASSWORD_ENV, "esp32/window/", MQTT_HOST_ENV, MQTT_PORT_ENV, callback);
-
-bool upload_init = false;
-String header = "timestamp,blinds_1_state,blinds_2_state,window_state\n";
-
-String get_todays_file_path()
-{
-  return "/" + comm->get_todays_date_string() + ".csv";
-};
-
-String get_yesterdays_file_path()
-{
-  return "/" + comm->get_yesterdays_date_string() + ".csv";
-};
-
-String output = "";
-
-void read_data()
-{
-  if (blinds_1_state == digitalRead(BLINDS_1_PIN) && blinds_2_state == digitalRead(BLINDS_2_PIN) && window_state == digitalRead(WINDOW_PIN))
-  {
-    return;
-  }
-
-  blinds_1_state = digitalRead(BLINDS_1_PIN);
-  blinds_2_state = digitalRead(BLINDS_2_PIN);
-  window_state = digitalRead(WINDOW_PIN);
-
-  output = "";
-  output += String(comm->get_rawtime()) + ",";
-  output += (blinds_1_state == HIGH) ? "1," : "0,";
-  output += (blinds_2_state == HIGH) ? "1," : "0,";
-  output += (window_state == HIGH) ? "1\n" : "0\n";
-
-  if (!file_exists(SD, get_todays_file_path().c_str()))
-  {
-    write_file(SD, get_todays_file_path().c_str(), header.c_str());
-  }
-  append_file(SD, get_todays_file_path().c_str(), output.c_str());
-}
 
 void setup()
 {
   Serial.begin(115200);
-
-  if (!SD.begin(14))
-  {
-    Serial.println("Card Mount Failed");
-    return;
-  }
-  uint8_t cardType = SD.cardType();
-
-  if (cardType == CARD_NONE)
-  {
-    Serial.println("No SD card attached");
-    return;
-  }
-
-  Serial.print("SD Card Type: ");
-  if (cardType == CARD_MMC)
-  {
-    Serial.println("MMC");
-  }
-  else if (cardType == CARD_SD)
-  {
-    Serial.println("SDSC");
-  }
-  else if (cardType == CARD_SDHC)
-  {
-    Serial.println("SDHC");
-  }
-  else
-  {
-    Serial.println("UNKNOWN");
-  }
-
-  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-  Serial.printf("SD Card Size: %lluMB\n", cardSize);
 
   pinMode(BLINDS_1_PIN, INPUT_PULLUP);
   pinMode(BLINDS_2_PIN, INPUT_PULLUP);
@@ -118,7 +47,47 @@ void loop()
   if (millis() - lastStateCheck > 60000)
   {
     lastStateCheck = millis();
-    read_data();
+    if (blinds_1_state == digitalRead(BLINDS_1_PIN) && blinds_2_state == digitalRead(BLINDS_2_PIN) && window_state == digitalRead(WINDOW_PIN))
+    {
+      return;
+    }
+
+    blinds_1_state = digitalRead(BLINDS_1_PIN);
+    blinds_2_state = digitalRead(BLINDS_2_PIN);
+    window_state = digitalRead(WINDOW_PIN);
+
+    JsonDocument sensor_data;
+    sensor_data["time"] = comm->get_rawtime();
+    sensor_data["device"] = comm->get_client_id();
+    JsonObject detail_sensor_data = sensor_data["data"].to<JsonObject>();
+    detail_sensor_data["blinds_1"] = blinds_1_state;
+    detail_sensor_data["blinds_2"] = blinds_2_state;
+    detail_sensor_data["window"] = window_state;
+
+    JsonDocument rtpnn_data;
+    rtpnn_data["time"] = comm->get_rawtime();
+    rtpnn_data["device"] = comm->get_client_id();
+    rtpnn_data["ml_algo"] = "rtpnn";
+    JsonObject detail_rtpnn_data = rtpnn_data["data"].to<JsonObject>();
+
+    JsonObject blinds_1_data = detail_rtpnn_data["blinds_1"].to<JsonObject>();
+    auto blinds_1_calc = blinds_1_sdp.execute_sdp(blinds_1_state);
+    blinds_1_data["trend"] = blinds_1_calc.first;
+    blinds_1_data["level"] = blinds_1_calc.second;
+
+    JsonObject blinds_2_data = detail_rtpnn_data["blinds_2"].to<JsonObject>();
+    auto blinds_2_calc = blinds_2_sdp.execute_sdp(blinds_2_state);
+    blinds_2_data["trend"] = blinds_2_calc.first;
+    blinds_2_data["level"] = blinds_2_calc.second;
+
+    JsonObject window_data = detail_rtpnn_data["window"].to<JsonObject>();
+    auto window_calc = window_sdp.execute_sdp(window_state);
+    window_data["trend"] = window_calc.first;
+    window_data["level"] = window_calc.second;
+
+    JsonDocument reglin_data;
+
+    comm->send_data(sensor_data, rtpnn_data, reglin_data);
   }
 
   if (millis() - lastHealthPing > 900000)
@@ -128,31 +97,4 @@ void loop()
     delay(5000);
     comm->pause_communication();
   }
-
-  auto current_time = comm->get_localtime();
-  if (current_time->tm_hour == 1 && !upload_init)
-  {
-    comm->resume_communication();
-    delay(2000);
-    comm->handle_mqtt_loop();
-    upload_init = true;
-    comm->publish("data", read_file(SD, get_yesterdays_file_path().c_str()));
-    delay(2000);
-    comm->pause_communication();
-  }
-  if (current_time->tm_hour == 2 && upload_init)
-  {
-    list_dir(SD, "/", 0);
-    upload_init = false;
-    checkAndCleanFileSystem(SD);
-  }
-
-  // if (millis() - lastDataUploadMillis > 60000)
-  // {
-  //   lastDataUploadMillis = millis();
-  //   if (file_exists(SD, get_todays_file_path().c_str()))
-  //   {
-  //     comm->publish("current_data", read_file(SD, get_todays_file_path().c_str()));
-  //   }
-  // }
 }
