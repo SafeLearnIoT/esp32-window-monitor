@@ -8,17 +8,29 @@
 #define BLINDS_2_PIN 26
 #define WINDOW_PIN 25
 
-auto ml_algo = MLAlgo::LogReg;
-auto blinds_1_ml = ML(Blinds, ml_algo, "blinds_1");
-auto blinds_2_ml = ML(Blinds, ml_algo, "blinds_2");
-auto window_ml = ML(Window, ml_algo, "window");
+auto blinds_1_ml = ML(Blinds, "blinds_1");
+auto blinds_2_ml = ML(Blinds, "blinds_2");
+auto window_ml = ML(Window, "window");
+
+void callback(String &topic, String &payload);
+
+auto comm = Communication::get_instance(SSID_ENV, PASSWORD_ENV, "esp32/window", MQTT_HOST_ENV, MQTT_PORT_ENV, callback);
 
 void callback(String &topic, String &payload)
 {
-  Serial.print("Topic: ");
-  Serial.print(topic);
-  Serial.print(", Payload: ");
-  Serial.println(payload);
+    Serial.println("[SUB][" + topic + "] " + payload);
+    if(payload == "get_weights")
+    {
+        comm->hold_connection();
+        comm->publish("cmd", "", true);
+        auto weights = blinds_1_ml.get_weights();
+        serializeJson(weights, Serial);
+        Serial.println();
+    }
+    if(payload=="set_weights")
+    {
+        comm->release_connection();
+    }
 }
 
 int blinds_1_state = -1;
@@ -27,7 +39,6 @@ int window_state = -1;
 unsigned long lastStateCheck = 0;
 unsigned long lastHealthPing = 0;
 
-auto comm = Communication::get_instance(SSID_ENV, PASSWORD_ENV, "esp32/window", MQTT_HOST_ENV, MQTT_PORT_ENV, callback);
 
 void setup()
 {
@@ -38,8 +49,6 @@ void setup()
   pinMode(WINDOW_PIN, INPUT_PULLUP);
 
   comm->setup();
-  delay(5000);
-  comm->pause_communication();
 }
 
 void loop()
@@ -53,7 +62,6 @@ void loop()
     }
 
     auto raw_time = comm->get_rawtime();
-    auto time_struct = localtime(&raw_time);
 
     blinds_1_state = digitalRead(BLINDS_1_PIN);
     blinds_2_state = digitalRead(BLINDS_2_PIN);
@@ -67,19 +75,15 @@ void loop()
     detail_sensor_data["blinds_2"] = blinds_2_state;
     detail_sensor_data["window"] = window_state;
 
-    JsonDocument ml_data;
-    if (ml_algo != MLAlgo::None)
-    {
-      ml_data["time_sent"] = raw_time;
-      ml_data["device"] = comm->get_client_id();
-      ml_data["ml_algo"] = algoString[ml_algo];
-      JsonObject data = ml_data["data"].to<JsonObject>();
-
-      blinds_1_ml.perform(*time_struct, blinds_1_state, data);
-      blinds_2_ml.perform(*time_struct, blinds_2_state, data);
-      window_ml.perform(*time_struct, window_state, data);
-    }
-    comm->send_data(sensor_data, ml_data);
+   
+    blinds_1_ml.perform(blinds_1_state);
+    blinds_2_ml.perform(blinds_2_state);
+    window_ml.perform(window_state);
+    
+    serializeJson(sensor_data, Serial);
+    Serial.println();
+  
+    comm->send_data(sensor_data);
   }
 
   if (millis() - lastHealthPing > 900000)
